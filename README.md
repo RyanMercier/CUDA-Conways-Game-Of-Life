@@ -52,19 +52,57 @@ image gets copied back each frame.
 
 ## What I found
 
-### Tiling didn't help
+### Nsight Compute
 
-The shared memory version came out within a few percent of the naive one (sometimes slightly
-faster, sometimes slightly slower between runs). The idea behind tiling is that each cell gets read
-9 times (by itself and its 8 neighbors), so loading it once into shared memory should save 8 reads.
-But Ada has a big L1 and a 32 MB L2, and neighboring threads read the same rows at almost the same
-time, so the cache was already catching most of those repeat reads. Tiling saved reads that weren't
-really going to DRAM anyway, and paid for it with the extra halo loads and a `__syncthreads()`.
+One generation of each kernel profiled with `make ncu` (`--set full`). Nsight Compute locks the GPU
+to its base clock (~1.3 GHz) while profiling, so the durations here are a bit different from the
+benchmark table, but the comparisons between kernels hold.
 
-### What actually mattered
+| | naive | tiled | bits | naive 16k | bits 16k |
+|---|---|---|---|---|---|
+| board | 4096² | 4096² | 4096² | 16384² | 16384² |
+| duration | 625 us | 755 us | 15.2 us | 9.22 ms | 255 us |
+| DRAM throughput (% of peak) | 86% | 72% | 63% | 90% | 90% |
+| DRAM bytes read | 67.2 MB | 67.2 MB | 2.1 MB | 1074 MB | 33.6 MB |
+| L1 hit rate | 75% | 17% | 75% | 75% | 75% |
+| L2 hit rate | 75% | 74% | 65% | 75% | 65% |
+| warp instructions executed | 76.5 M | 71.8 M | 1.36 M | 1225 M | 21.8 M |
+| shared memory bank conflicts | 0 | 4.8 M | 0 | 0 | 0 |
+| registers per thread | 26 | 37 | 26 | 26 | 26 |
 
-I swept block shapes, data types and the wrap-around math (4096 x 4096, 1000 generations, all
-results checked cell by cell against the naive kernel):
+**The naive kernel is memory bound.** It's at 86 to 90% of DRAM bandwidth. It reads 67.2 MB from DRAM
+per generation, which is exactly the size of the board (4096 x 4096 x 4 bytes). So every cell comes
+from DRAM once, and the other 8 times it gets read as somebody's neighbor are served by L1 and L2
+(both 75% hit rate).
+
+**That's why tiling didn't help.** Tiling is supposed to turn those 9 reads per cell into 1, but the
+cache was already doing that. The tiled kernel reads the exact same 67.2 MB from DRAM. The reuse just
+moved from L1 (hit rate drops from 75% to 17%) into shared memory, and on top of that it picks up:
+
+- **4.8 M shared memory bank conflicts.** Shared memory has 32 banks, and word `i` lives in bank
+  `i % 32`. A warp is 32 threads, which in a 16 x 16 block is two rows of 16. Tile rows are 18 ints
+  wide, so row 1 starts at word 18 and covers banks 18 to 31 and then wraps to 0 and 1, which row 0
+  is already using. So every neighbor read is a 2-way conflict and has to be done in two passes:
+  9 reads x 524,288 warps = 4.7 M, which is almost exactly what Nsight counted.
+- **37 registers instead of 26**, the extra halo loads, and a `__syncthreads()` per block.
+
+Under the profiler's locked clocks it comes out 20% slower than naive. In normal runs it's about even.
+
+**The `%` mattered, but only up to the memory limit.** Profiling the no-`%` version of the `int` kernel
+the same way puts it at 92 to 94% of DRAM bandwidth, compared to 86% for naive. That's the wall for
+4 byte cells. After that, the only way to go faster is to move fewer bytes per cell.
+
+**Bit packing moves 32x fewer bytes and runs 56x fewer instructions.** At 16384 x 16384 the bits kernel
+reads 33.6 MB per generation, again exactly the size of the board (16384 x 16384 / 8), and it's
+back at 90% of DRAM bandwidth. But each byte now holds 8 cells instead of a quarter of one. It executes
+21.8 M warp instructions against naive's 1225 M, which works out to about 2.6 instructions per cell
+instead of 146. At 4096 x 4096 the whole board is only 2 MB, so it stays in the 32 MB L2 (Nsight shows
+0 bytes written to DRAM). The kernel is done in 15 us, which is too short to fill the GPU.
+
+### Tuning sweep
+
+Block shapes, data types and the wrap-around math, timed with `cudaEvent`s at normal clocks
+(4096 x 4096, 1000 generations, every result checked cell by cell against the naive kernel):
 
 | Change | ms per gen | vs naive |
 |---|---|---|
@@ -79,19 +117,13 @@ results checked cell by cell against the naive kernel):
 
 - **Block shape barely matters** as long as the block is at least 32 wide, so a warp reads one
   continuous piece of a row. 32 x 32 was the only shape that was clearly worse.
-- **The `%` was costing ~20%.** Integer division is slow on the GPU, and the naive kernel does 16 of
-  them per cell. Swapping them for `if`s brought the `int` version to roughly 240 GB/s of effective
-  bandwidth (each grid read once and written once per generation), which is about all this card has.
-  So the naive kernel was partly held back by math, not only by memory.
-- **Smaller cells only help once the math is gone.** `int` to `unsigned char` is 4x less data but only
-  1.4x faster on its own. With `%` removed as well it's 2.5x. At 16384 x 16384 the byte version only
-  reaches ~110 GB/s, so it's limited by the number of load instructions (9 single-byte loads per cell)
-  rather than bandwidth.
-- **Bit packing fixes both problems at once**: 32x less data, and one load brings in 32 cells. At
-  16384 x 16384 it reaches roughly 210 to 220 GB/s effective, back near the memory limit, but now each
-  byte carries 8 cells instead of a quarter of one.
-- **Walking several rows per thread** (reusing the rows already loaded) helped a little at 4096 x 4096
-  but was ~25% slower at 16384 x 16384, so the simple one-word-per-thread kernel is the one in the repo.
+- **Smaller cells only pay off once the `%` is gone.** `int` to `unsigned char` is 4x less data but
+  only 1.4x faster on its own, and 2.5x with the `if`s. From the timings, the byte version at
+  16384 x 16384 only moves ~110 GB/s, so it looks limited by the 9 single-byte loads per cell rather
+  than by bandwidth. I haven't profiled that one.
+- **Walking several rows per thread** (reusing rows that are already loaded) helped a little at
+  4096 x 4096 but was ~25% slower at 16384 x 16384, so the simple one-word-per-thread kernel is the
+  one in the repo.
 
 ### Nsight Systems
 
@@ -114,8 +146,9 @@ Profiled with `make nsys` (CUDA API trace + NVTX ranges, 4096 x 4096, 1000 gener
   wouldn't be able to launch kernels as fast as the GPU finishes them. A CUDA Graph, or running
   several generations per launch, would be the next step.
 
-GPU-side kernel timings aren't in these reports yet. On WSL, Nsight needs GPU performance counter
-access turned on in the Windows NVIDIA Control Panel (see below).
+On this WSL setup Nsight Systems records the CUDA API calls and NVTX ranges but not the kernels
+themselves (tried 2024.5 and 2025.1), so kernel durations come from Nsight Compute and the
+`cudaEvent` timers instead.
 
 ## Building and running
 
@@ -139,7 +172,7 @@ Visualizer controls: space pause, right arrow single step, up/down generations p
 
 Ubuntu's packaged `nsys`/`ncu` (2022.4) are too old for driver 561. The Makefile points at the
 CUDA 12.6 versions (Nsight Systems 2024.5.1, Nsight Compute 2024.3.2) unpacked from NVIDIA's apt
-repo into `~/.local/nsight`. Kernel timings and Nsight Compute also need
+repo into `~/.local/nsight`. Nsight Compute also needs
 **NVIDIA Control Panel > Desktop > Enable Developer Settings**, then
 **Developer > Manage GPU Performance Counters > Allow access to the GPU performance counters to all users**
 on the Windows side.

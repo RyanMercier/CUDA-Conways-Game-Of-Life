@@ -56,6 +56,8 @@ ncu: gpu_life_bench gpu_life_tiled gpu_life_bits
 	$(NCU) --set full -k step_gpu_kernel -s 2 -c 1 -o profiles/naive --force-overwrite ./gpu_life_bench 4096 4096 5
 	$(NCU) --set full -k step_gpu_tiled -s 2 -c 1 -o profiles/tiled --force-overwrite ./gpu_life_tiled 4096 4096 5
 	$(NCU) --set full -k step_gpu_bits -s 2 -c 1 -o profiles/bits --force-overwrite ./gpu_life_bits 4096 4096 5
+	$(NCU) --set full -k step_gpu_kernel -s 2 -c 1 -o profiles/naive16k --force-overwrite ./gpu_life_bench 16384 16384 5
+	$(NCU) --set full -k step_gpu_bits -s 2 -c 1 -o profiles/bits16k --force-overwrite ./gpu_life_bits 16384 16384 5
 
 clean:
 	rm -f cpu_life_bench gpu_life_bench gpu_life_tiled gpu_life_bits life_viz cpu_life gpu_life life
