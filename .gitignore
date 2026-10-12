@@ -1,0 +1,18 @@
+# binaries
+cpu_life
+gpu_life
+life
+cpu_life_bench
+gpu_life_bench
+gpu_life_tiled
+gpu_life_bits
+life_viz
+
+# profiler output
+profiles/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.qdstrm
+
+.vscode/
